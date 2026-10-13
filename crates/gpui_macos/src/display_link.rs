@@ -64,6 +64,18 @@ use std::{
 
 static REGISTRY: Mutex<Registry> = Mutex::new(Registry::new());
 
+type FrameWake = Box<dyn Fn() + Send>;
+
+static FRAME_WAKE: Mutex<Option<FrameWake>> = Mutex::new(None);
+
+/// Runs `wake` on the display's io thread at every vsync that requests a frame.
+///
+/// An embedded host only drains the main queue when it pumps AppKit, so a frame
+/// signalled here waits for its next pump; `wake` lets it pump at vsync instead.
+pub fn set_frame_wake(wake: Option<FrameWake>) {
+    *FRAME_WAKE.lock().unwrap_or_else(PoisonError::into_inner) = wake;
+}
+
 struct Registry {
     displays: BTreeMap<CGDirectDisplayID, DisplayEntry>,
     next_subscriber_id: u64,
@@ -125,11 +137,24 @@ unsafe extern "C" fn display_link_output_callback(
     display_id: *mut c_void,
 ) -> i32 {
     let display_id = display_id as usize as CGDirectDisplayID;
-    let registry = lock_registry();
-    if let Some(entry) = registry.displays.get(&display_id) {
-        for (_, frame_requests) in &entry.subscribers {
+    let signalled = {
+        let registry = lock_registry();
+        let subscribers = registry
+            .displays
+            .get(&display_id)
+            .map_or(&[][..], |entry| &entry.subscribers[..]);
+        for (_, frame_requests) in subscribers {
             frame_requests.merge_data(1);
         }
+        !subscribers.is_empty()
+    };
+    if signalled
+        && let Some(wake) = FRAME_WAKE
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+    {
+        wake();
     }
     0
 }
