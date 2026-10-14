@@ -852,6 +852,9 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn background_appearance(&self) -> WindowBackgroundAppearance;
     fn set_title(&mut self, title: &str);
     fn set_background_appearance(&self, background_appearance: WindowBackgroundAppearance);
+    /// Sets the blur radius, in points, behind a `Blurred` background. `None` restores the system
+    /// blur. Only macOS can change it; elsewhere this does nothing.
+    fn set_background_blur_radius(&self, _radius: Option<f32>) {}
     fn minimize(&self);
     fn zoom(&self);
     fn toggle_fullscreen(&self);

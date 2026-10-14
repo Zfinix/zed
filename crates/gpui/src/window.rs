@@ -2662,6 +2662,12 @@ impl Window {
             .set_background_appearance(background_appearance);
     }
 
+    /// Sets the blur radius, in points, behind a `Blurred` background. `None` restores the system
+    /// blur. Only macOS can change it; elsewhere this does nothing.
+    pub fn set_background_blur_radius(&self, radius: Option<f32>) {
+        self.platform_window.set_background_blur_radius(radius);
+    }
+
     /// Mark the window as dirty at the platform level.
     pub fn set_window_edited(&mut self, edited: bool) {
         self.platform_window.set_edited(edited);

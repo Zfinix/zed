@@ -75,6 +75,8 @@ use std::{
 };
 
 const WINDOW_STATE_IVAR: &str = "windowState";
+const BLUR_RADIUS_IVAR: &str = "blurRadius";
+const SYSTEM_BLUR_RADIUS_IVAR: &str = "systemBlurRadius";
 
 static mut WINDOW_CLASS: *const Class = ptr::null();
 static mut PANEL_CLASS: *const Class = ptr::null();
@@ -302,6 +304,8 @@ unsafe fn build_classes() {
         };
         BLURRED_VIEW_CLASS = {
             let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
+            decl.add_ivar::<f64>(BLUR_RADIUS_IVAR);
+            decl.add_ivar::<f64>(SYSTEM_BLUR_RADIUS_IVAR);
             decl.add_method(
                 sel!(initWithFrame:),
                 blurred_view_init_with_frame as extern "C" fn(&Object, Sel, NSRect) -> id,
@@ -593,6 +597,7 @@ struct MacWindowState {
     native_view: NonNull<Object>,
     blurred_view: Option<id>,
     background_appearance: WindowBackgroundAppearance,
+    background_blur_radius: Option<f32>,
     cursor_style: CursorStyle,
     cursor_visible: Arc<AtomicBool>,
     frame_source: Option<WindowFrameSource>,
@@ -1019,6 +1024,7 @@ impl MacWindow {
                 native_view: NonNull::new_unchecked(native_view),
                 blurred_view: None,
                 background_appearance: WindowBackgroundAppearance::Opaque,
+                background_blur_radius: None,
                 cursor_style: CursorStyle::Arrow,
                 cursor_visible,
                 frame_source: None,
@@ -1681,6 +1687,7 @@ impl PlatformWindow for MacWindow {
                 let mut blur_view: id = msg_send![BLURRED_VIEW_CLASS, alloc];
                 blur_view = NSView::initWithFrame_(blur_view, frame);
                 blur_view.setAutoresizingMask_(NSViewWidthSizable | NSViewHeightSizable);
+                set_blurred_view_radius(blur_view, this.background_blur_radius);
 
                 let _: () = msg_send![
                     content_view,
@@ -1690,6 +1697,14 @@ impl PlatformWindow for MacWindow {
                 ];
                 this.blurred_view = Some(blur_view.autorelease());
             }
+        }
+    }
+
+    fn set_background_blur_radius(&self, radius: Option<f32>) {
+        let mut this = self.0.as_ref().lock();
+        this.background_blur_radius = radius;
+        if let Some(blur_view) = this.blurred_view {
+            unsafe { set_blurred_view_radius(blur_view, radius) };
         }
     }
 
@@ -3427,11 +3442,13 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
 
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
     unsafe {
-        let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
+        let view: id = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
         // Use a colorless semantic material. The default value `AppearanceBased`, though not
         // manually set, is deprecated.
         NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::Selection);
         NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
+        (*view).set_ivar::<f64>(BLUR_RADIUS_IVAR, -1.0);
+        (*view).set_ivar::<f64>(SYSTEM_BLUR_RADIUS_IVAR, -1.0);
         view
     }
 }
@@ -3442,6 +3459,82 @@ extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
         let layer: id = msg_send![this, layer];
         if !layer.is_null() {
             remove_layer_background(layer);
+            apply_blur_radius(this as *const Object as id, layer);
+        }
+    }
+}
+
+unsafe fn set_blurred_view_radius(view: id, radius: Option<f32>) {
+    unsafe {
+        (*view).set_ivar::<f64>(BLUR_RADIUS_IVAR, radius.map_or(-1.0, |radius| radius.max(0.0) as f64));
+        let layer: id = msg_send![view, layer];
+        if !layer.is_null() {
+            apply_blur_radius(view, layer);
+        }
+    }
+}
+
+/// `NSVisualEffectView` blurs through a backdrop layer holding a "gaussianBlur" filter, and
+/// `updateLayer` rebuilds it with the system radius. The radius is set through the layer's
+/// `filters.<name>.inputRadius` key path, and the first system value is kept so `None` restores it.
+unsafe fn apply_blur_radius(view: id, layer: id) {
+    unsafe {
+        let wanted: f64 = *(*view).get_ivar(BLUR_RADIUS_IVAR);
+        let system: f64 = *(*view).get_ivar(SYSTEM_BLUR_RADIUS_IVAR);
+        if wanted < 0.0 && system < 0.0 {
+            return;
+        }
+        let mut paths = Vec::new();
+        blur_radius_paths(layer, &mut paths);
+        if paths.is_empty() {
+            return;
+        }
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: YES];
+        for (owner, path) in paths {
+            if system < 0.0 {
+                let current: id = msg_send![owner, valueForKeyPath: path];
+                if !current.is_null() {
+                    let value: f64 = msg_send![current, doubleValue];
+                    (*view).set_ivar::<f64>(SYSTEM_BLUR_RADIUS_IVAR, value);
+                }
+            }
+            let radius = if wanted >= 0.0 { wanted } else { system };
+            let number: id = msg_send![class!(NSNumber), numberWithDouble: radius];
+            let _: () = msg_send![owner, setValue: number forKeyPath: path];
+        }
+        let _: () = msg_send![class!(CATransaction), commit];
+    }
+}
+
+unsafe fn blur_radius_paths(layer: id, paths: &mut Vec<(id, id)>) {
+    unsafe {
+        let filters: id = msg_send![layer, filters];
+        if !filters.is_null() {
+            let blur = ns_string("gaussianBlur");
+            for i in 0..NSArray::count(filters) {
+                let filter = filters.objectAtIndex(i);
+                let names: BOOL = msg_send![filter, respondsToSelector: sel!(name)];
+                if names == NO {
+                    continue;
+                }
+                let name: id = msg_send![filter, name];
+                if name.is_null() {
+                    continue;
+                }
+                let description: id = msg_send![filter, description];
+                let hit: BOOL = msg_send![description, containsString: blur];
+                if hit == YES {
+                    let path = format!("filters.{}.inputRadius", name.to_str());
+                    paths.push((layer, ns_string(&path)));
+                }
+            }
+        }
+        let sublayers: id = msg_send![layer, sublayers];
+        if !sublayers.is_null() {
+            for i in 0..NSArray::count(sublayers) {
+                blur_radius_paths(sublayers.objectAtIndex(i), paths);
+            }
         }
     }
 }
